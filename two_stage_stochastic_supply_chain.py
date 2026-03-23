@@ -1,8 +1,8 @@
 """
-Two-stage stochastic closed-loop supply chain model (Gurobi).
+Two-stage stochastic closed-loop supply chain model (Gurobi) with regret-based DRO.
 
-This version is a regret-based base model (no DRO dual reformulation yet).
-All data are placeholders on small dummy sets so you can replace them easily.
+This script uses small dummy sets and placeholder parameters only.
+Replace values in `build_dummy_data()` with your real data later.
 """
 
 from __future__ import annotations
@@ -41,6 +41,10 @@ def build_dummy_data() -> Dict[str, Any]:
     B = data["B"]
     T = data["T"]
     Omega = data["Omega"]
+
+    # Nominal scenario probabilities and L1 ambiguity budget
+    data["p_nominal"] = {"base": 0.60, "stress": 0.40}
+    data["Gamma"] = 0.40
 
     # Regret reference cost per scenario (placeholder)
     data["regret_reference"] = {"base": 1700.0, "stress": 2100.0}
@@ -141,6 +145,82 @@ def validate_dummy_data(data: Dict[str, Any]) -> None:
         if abs(total_share - 1.0) > 1e-9:
             raise ValueError(f"Split coefficients for battery {b} must sum to 1.0.")
 
+    omega_set = set(data["Omega"])
+    nominal_set = set(data["p_nominal"].keys())
+    if omega_set != nominal_set:
+        raise ValueError("`p_nominal` keys must match scenario set Omega exactly.")
+
+    nominal_sum = sum(data["p_nominal"][w] for w in data["Omega"])
+    if abs(nominal_sum - 1.0) > 1e-9:
+        raise ValueError("Nominal probabilities must sum to 1.")
+
+    if any(data["p_nominal"][w] < 0.0 for w in data["Omega"]):
+        raise ValueError("Nominal probabilities must be nonnegative.")
+
+    if data["Gamma"] < 0.0:
+        raise ValueError("Gamma must be nonnegative.")
+
+
+def add_dro_dual_objective(
+    model: gp.Model, Reg: gp.tupledict, data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Add the DRO dual reformulation for:
+
+        max_p  sum_w p_w Reg_w
+        s.t.   sum_w p_w = 1
+               p_w >= 0
+               ||p - p_nominal||_1 <= Gamma
+
+    using LP duality (inner maximization replaced by its dual minimization).
+    """
+    Omega = data["Omega"]
+    p_nominal = data["p_nominal"]
+    gamma = data["Gamma"]
+
+    # Dual variables:
+    # lambda: free dual for sum p_w = 1
+    # eta >= 0: dual for L1 budget
+    # mu_plus, mu_minus >= 0: duals for p_w - pbar_w <= u_w and -p_w + pbar_w <= u_w
+    dro_lambda = model.addVar(lb=-GRB.INFINITY, name="dro_lambda")
+    dro_eta = model.addVar(lb=0.0, name="dro_eta")
+    dro_mu_plus = model.addVars(Omega, lb=0.0, name="dro_mu_plus")
+    dro_mu_minus = model.addVars(Omega, lb=0.0, name="dro_mu_minus")
+
+    # Dual feasibility constraints
+    model.addConstrs(
+        (
+            dro_lambda + dro_mu_plus[w] - dro_mu_minus[w] >= Reg[w]
+            for w in Omega
+        ),
+        name="dro_dual_regret_domination",
+    )
+    model.addConstrs(
+        (
+            dro_eta - dro_mu_plus[w] - dro_mu_minus[w] >= 0.0
+            for w in Omega
+        ),
+        name="dro_dual_l1_support",
+    )
+
+    # Dual objective equals worst-case expected regret under the L1 ambiguity set.
+    dro_worst_case_regret = (
+        dro_lambda
+        + gamma * dro_eta
+        + gp.quicksum(
+            p_nominal[w] * (dro_mu_plus[w] - dro_mu_minus[w]) for w in Omega
+        )
+    )
+    model.setObjective(dro_worst_case_regret, GRB.MINIMIZE)
+
+    return {
+        "dro_lambda": dro_lambda,
+        "dro_eta": dro_eta,
+        "dro_mu_plus": dro_mu_plus,
+        "dro_mu_minus": dro_mu_minus,
+        "dro_worst_case_regret_expr": dro_worst_case_regret,
+    }
+
 
 def build_model(data: Dict[str, Any]) -> Tuple[gp.Model, Dict[str, Any]]:
     """Build and return the Gurobi model and variable dictionary."""
@@ -180,10 +260,6 @@ def build_model(data: Dict[str, Any]) -> Tuple[gp.Model, Dict[str, Any]]:
     delta = model.addVars(R, D, G, T, Omega, lb=0.0, name="delta_rdgtw")
     P = model.addVars(M, B, T, Omega, lb=0.0, name="P_mbtw")
     Reg = model.addVars(Omega, lb=0.0, name="Reg")
-
-    # Epigraph variable for min max_p sum_w p_w * Reg_w over simplex p:
-    # worst-case expectation is max_w Reg[w] in this base regret model.
-    worst_case_regret = model.addVar(lb=0.0, name="WorstCaseRegret")
 
     # ----------------
     # Core constraints
@@ -473,12 +549,7 @@ def build_model(data: Dict[str, Any]) -> Tuple[gp.Model, Dict[str, Any]]:
         ),
         name="regret_definition",
     )
-    model.addConstrs(
-        (worst_case_regret >= Reg[w] for w in Omega),
-        name="worst_case_regret_epigraph",
-    )
-
-    model.setObjective(worst_case_regret, GRB.MINIMIZE)
+    dro_vars = add_dro_dual_objective(model, Reg, data)
 
     vars_dict = {
         "z_s": z_s,
@@ -496,7 +567,7 @@ def build_model(data: Dict[str, Any]) -> Tuple[gp.Model, Dict[str, Any]]:
         "delta": delta,
         "P": P,
         "Reg": Reg,
-        "WorstCaseRegret": worst_case_regret,
+        **dro_vars,
     }
     return model, vars_dict
 
@@ -509,7 +580,7 @@ def solve_and_report(model: gp.Model, vars_dict: Dict[str, Any], data: Dict[str,
         print(f"Model status: {model.Status}")
         return
 
-    print(f"\nOptimal worst-case regret: {vars_dict['WorstCaseRegret'].X:.4f}")
+    print(f"\nOptimal DRO worst-case expected regret: {model.ObjVal:.4f}")
 
     print("\nSelected suppliers:")
     for s in data["S"]:
@@ -534,6 +605,10 @@ def solve_and_report(model: gp.Model, vars_dict: Dict[str, Any], data: Dict[str,
     print("\nScenario regrets:")
     for w in data["Omega"]:
         print(f"  {w}: {vars_dict['Reg'][w].X:.4f}")
+
+    print("\nDRO dual summary:")
+    print(f"  lambda: {vars_dict['dro_lambda'].X:.4f}")
+    print(f"  eta:    {vars_dict['dro_eta'].X:.4f}")
 
 
 def main() -> None:
